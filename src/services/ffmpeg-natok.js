@@ -817,9 +817,17 @@ function applyColorGrade(videoChain, grade, customFilter = '') {
   if (grade === 'custom') {
     filter = (customFilter || '').trim() || 'eq=saturation=1.0';
   } else if (grade === 'warm') {
-    filter = `eq=saturation=1.3:contrast=1.22:brightness=-0.05:gamma_r=1.08:gamma_b=0.88,colorlevels=romin=0.04:gomin=0.02:bomin=0.0:rimax=0.96:gimax=0.94:bimax=0.88`;
+    filter =
+      `eq=contrast=1.28:brightness=0.02:saturation=1.28:gamma=1.04:` +
+      `gamma_r=1.12:gamma_g=1.04:gamma_b=0.90,` +
+      `colorbalance=rs=0.06:gs=0.01:bs=-0.05,` +
+      `unsharp=7:7:1.1:5:5:0.4`;
   } else if (grade === 'cool') {
-    filter = `eq=saturation=0.65:contrast=1.08:brightness=0.04:gamma_r=0.88:gamma_b=1.18,colorlevels=romin=0.0:gomin=0.04:bomin=0.12:rimax=0.88:gimax=0.92:bimax=1.0`;
+    filter =
+      `eq=contrast=1.28:brightness=0.02:saturation=1.14:gamma=1.04:` +
+      `gamma_r=0.88:gamma_g=1.00:gamma_b=1.18,` +
+      `colorbalance=rs=-0.05:gs=0.00:bs=0.09,` +
+      `unsharp=7:7:1.1:5:5:0.4`;
   } else if (grade === 'cinema') {
     filter = `eq=saturation=0.82:contrast=1.18:brightness=-0.04:gamma=0.92`;
   } else if (grade === 'vivid') {
