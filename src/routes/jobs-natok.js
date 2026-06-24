@@ -8,7 +8,7 @@ router.post('/', (req, res) => {
   try {
     const {
       url, speaker, defaultStyle, cropMode, clips, partial,
-      colorGrade, musicUrl, musicVolume,
+      colorGrade, musicUrl, musicVolume, musicStart, musicEnd,
       headerText, followText, ducking,
     } = req.body || {};
 
@@ -37,7 +37,7 @@ router.post('/', (req, res) => {
 
     const job = createJob({
       url, speaker, defaultStyle, cropMode, clips, partial,
-      colorGrade, musicUrl, musicVolume,
+      colorGrade, musicUrl, musicVolume, musicStart, musicEnd,
       headerText, followText, ducking,
     });
     logger.info(`[natok route] ✓ job ${job.id} created with ${job.clips.length} clip(s)`);

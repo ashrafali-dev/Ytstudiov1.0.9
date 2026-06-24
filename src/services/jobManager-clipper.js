@@ -13,11 +13,11 @@
 const { v4: uuid } = require('uuid');
 const path = require('path');
 const fs = require('fs');
-const { execFileSync } = require('child_process');
 const { logger } = require('../utils/logger');
 const { parseRange } = require('../utils/timestamp');
-const { downloadVideo, killJob: killYtdlpJob } = require('./ytdlp-clipper');
-const { makeClip, concatClips, killJob: killFfmpegJob } = require('./ffmpeg');
+const { downloadVideo, killJob: killYtdlpJob, buildCommonArgs } = require('./ytdlp-clipper');
+const ffmpegMod = require('./ffmpeg');
+const { makeClip, concatClips, killJob: killFfmpegJob } = ffmpegMod;
 const { injectThumbnailCard, killJob: killThumbJob } = require('./ffmpeg-thumbnail');
 
 const OUTPUT_DIR = process.env.OUTPUT_DIR || '/app/data/output';
@@ -42,12 +42,30 @@ function enqueueJob(id) {
 
 function _drainQueue() {
   if (_queueRunning || !_queue.length) return;
+  // Skip any queued jobs that were aborted before they started
+  while (_queue.length && aborted.has(_queue[0].id)) {
+    const { id, resolve } = _queue.shift();
+    logger.info(`[job:${id}] skipped from queue (already aborted)`);
+    resolve();
+  }
+  if (!_queue.length) return;
   _queueRunning = true;
   const { id, resolve, reject } = _queue.shift();
   runJob(id).then(resolve, reject).finally(() => {
     _queueRunning = false;
     _drainQueue();
   });
+}
+
+// Remove a job from the waiting queue without running it
+function _removeFromQueue(id) {
+  const idx = _queue.findIndex(e => e.id === id);
+  if (idx !== -1) {
+    const { resolve } = _queue.splice(idx, 1)[0];
+    resolve(); // resolve so the enqueueJob Promise doesn't hang
+    return true;
+  }
+  return false;
 }
 // ────────────────────────────────────────────────────────────────────
 
@@ -112,7 +130,7 @@ const VALID_STYLES = new Set([
   'natok_purple', 'natok_gold2', 'natok_green',
 ]);
 const VALID_CROPS  = new Set(['crop', 'fit']);
-const VALID_GRADES = new Set(['none', 'warm', 'cool', 'cinema']);
+const VALID_GRADES = new Set(['none', 'warm', 'cool', 'cinema', 'bright', 'natural']);
 
 function buildDucking(payload) {
   const d = payload && typeof payload === 'object' ? payload : {};
@@ -125,6 +143,24 @@ function buildDucking(payload) {
   };
 }
 
+function parseSubTs(ts) {
+  const parts = String(ts).trim().split(':');
+  if (parts.length === 3) return +parts[0] * 3600 + +parts[1] * 60 + +parts[2];
+  if (parts.length === 2) return +parts[0] * 60 + +parts[1];
+  return parseFloat(ts) || 0;
+}
+
+function normalizeSubtitles(raw) {
+  if (!Array.isArray(raw) || !raw.length) return [];
+  return raw
+    .map(s => ({
+      t:    String(s.t || s.time || s.start || '0').trim(),
+      text: String(s.text || s.txt || '').trim(),
+    }))
+    .filter(s => s.text.length > 0)
+    .sort((a, b) => parseSubTs(a.t) - parseSubTs(b.t));
+}
+
 function createJob(payload) {
   const id = uuid().slice(0, 8);
   const defaultStyle = VALID_STYLES.has(payload.defaultStyle) ? payload.defaultStyle : 'centered';
@@ -133,6 +169,8 @@ function createJob(payload) {
   const partial      = payload.partial !== false;
   const musicUrl     = payload.musicUrl || null;
   const musicVolume  = clamp(payload.musicVolume, 0, 1, 0.15);
+  const musicStart   = clamp(payload.musicStart, 0, 86400, 0);
+  const musicEnd     = clamp(payload.musicEnd, 0, 86400, 0);
   const ducking      = buildDucking(payload.ducking);
 
   // Thumbnail card injection (mid-frame, ~0.004s, used as YT thumbnail).
@@ -156,6 +194,8 @@ function createJob(payload) {
     partial,
     musicUrl,
     musicVolume,
+    musicStart,
+    musicEnd,
     ducking,
     thumbnailCard,
     musicPath: null,
@@ -170,10 +210,14 @@ function createJob(payload) {
         ranges: ranges.length > 1 ? ranges : undefined,
         recap: ranges.length > 1,
         style: VALID_STYLES.has(c.style) ? c.style : defaultStyle,
+        subtitles: normalizeSubtitles(c.subtitles),
         status: 'pending',
         filename: null,
         error: null,
         driveFileId: null,
+        telegramUploaded: false,
+        telegramMessageId: null,
+        telegramFileId: null,
       };
     }),
     sourcePath: null,
@@ -192,30 +236,55 @@ function checkAborted(id) {
 
 function downloadMusic(job, jl) {
   if (!job.musicUrl) return null;
-  try {
+  return new Promise((resolve) => {
+    if (aborted.has(job.id)) { resolve(null); return; }
     const musicOut = path.join(TEMP_DIR, `${job.id}_music.%(ext)s`);
-    fs.mkdirSync(path.dirname(musicOut), { recursive: true });
+    try { fs.mkdirSync(path.dirname(musicOut), { recursive: true }); } catch (_) {}
     jl.info(`🎵 Downloading music: ${job.musicUrl}`);
-    execFileSync('yt-dlp', [
+    const { spawn: sp } = require('child_process');
+    const musicArgs = [
+      ...buildCommonArgs(jl),
       '-x', '--audio-format', 'm4a',
       '-o', musicOut,
-      '--no-playlist',
-      '--no-warnings',
       job.musicUrl,
-    ], { stdio: 'ignore', timeout: 120000 });
+    ];
+    const proc = sp('yt-dlp', musicArgs, { stdio: 'ignore' });
 
-    const dir = path.dirname(musicOut);
-    const base = path.basename(musicOut, '.%(ext)s');
-    const hit = fs.readdirSync(dir).find(f => f.startsWith(base + '.'));
-    if (hit) {
-      const full = path.join(dir, hit);
-      jl.info(`✓ Music downloaded: ${full}`);
-      return full;
+    // Register with ffmpeg's RUNNING map so killJob can reach it
+    const RUNNING_MAP = ffmpegMod.__RUNNING__;
+    if (RUNNING_MAP) {
+      if (!RUNNING_MAP.has(job.id)) RUNNING_MAP.set(job.id, new Set());
+      RUNNING_MAP.get(job.id).add(proc);
+      proc.on('close', () => {
+        const s = RUNNING_MAP.get(job.id);
+        if (s) { s.delete(proc); if (!s.size) RUNNING_MAP.delete(job.id); }
+      });
     }
-  } catch (e) {
-    jl.warn(`Music download failed (continuing without music): ${e.message}`);
-  }
-  return null;
+
+    const timer = setTimeout(() => { try { proc.kill('SIGKILL'); } catch(_){} }, 120000);
+    proc.on('close', (code) => {
+      clearTimeout(timer);
+      if (aborted.has(job.id)) { resolve(null); return; }
+      const dir = path.dirname(musicOut);
+      const base = path.basename(musicOut, '.%(ext)s');
+      try {
+        const hit = fs.readdirSync(dir).find(f => f.startsWith(base + '.'));
+        if (hit) {
+          const full = path.join(dir, hit);
+          jl.info(`✓ Music downloaded: ${full}`);
+          resolve(full);
+          return;
+        }
+      } catch (_) {}
+      jl.warn('Music download failed or aborted (continuing without music)');
+      resolve(null);
+    });
+    proc.on('error', (e) => {
+      clearTimeout(timer);
+      jl.warn(`Music download error (continuing without music): ${e.message}`);
+      resolve(null);
+    });
+  });
 }
 
 async function runJob(id) {
@@ -227,7 +296,7 @@ async function runJob(id) {
   saveStore();
 
   try {
-    job.musicPath = downloadMusic(job, jl);
+    job.musicPath = await downloadMusic(job, jl);
 
     const rangeMap = [];
     const clipRanges = [];
@@ -286,6 +355,7 @@ async function runJob(id) {
             : out;
 
           jl.info(`   ↳ Part ${partNo + 1}/${partRanges.length}: source=${path.basename(src.sourcePath)}, sectionStart=${(src.sectionStart || 0).toFixed(2)}s, origStart=${origStart}s → localStart=${localStart.toFixed(2)}s, dur=${duration}s`);
+          jl.info(`   ↳ subtitles count: ${(clip.subtitles || []).length} | first: ${clip.subtitles && clip.subtitles[0] ? JSON.stringify(clip.subtitles[0]) : 'none'}`);
 
           await makeClip({
             input: src.sourcePath,
@@ -298,6 +368,8 @@ async function runJob(id) {
             colorGrade: job.colorGrade || 'none',
             musicFile: job.musicPath || null,
             musicVolume: job.musicVolume || 0.15,
+            musicStart: job.musicStart || 0,
+            musicEnd: job.musicEnd || 0,
             output: partOut,
             workDir: path.join(TEMP_DIR, id),
             jobLog: jl,
@@ -305,6 +377,7 @@ async function runJob(id) {
             customHeaderText: job.headerText,
             followText: job.followText,
             ducking: job.ducking,
+            subtitles: clip.subtitles || [],
           });
 
           tempParts.push(partOut);
@@ -385,6 +458,7 @@ function deleteJob(id) {
   if (!j) return false;
 
   aborted.add(id);
+  _removeFromQueue(id); // cancel if still waiting in queue
   const ytKilled    = killYtdlpJob(id);
   const ffKilled    = killFfmpegJob ? killFfmpegJob(id) : 0;
   const thumbKilled = killThumbJob ? killThumbJob(id) : 0;
@@ -408,4 +482,4 @@ function deleteJob(id) {
   return true;
 }
 
-module.exports = { createJob, getJob, listJobs, deleteJob };
+module.exports = { createJob, getJob, listJobs, deleteJob, saveStore };

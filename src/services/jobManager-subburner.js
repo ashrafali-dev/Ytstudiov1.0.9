@@ -134,14 +134,38 @@ function createJob(payload) {
     sources:    Array.isArray(payload.sources) ? payload.sources : [],  // recap mode
     recapMerge: !!payload.recapMerge,
     targets:    Array.isArray(payload.targets) ? payload.targets : [],
-    // screenshot_recap fields
+
+    // ── New fields ──────────────────────────────────────────────────
+    colorGrade:   payload.colorGrade  || 'natural',   // none|natural|bright|vivid|warm|cinema
+    subPos:       payload.subPos      || 'bottom',    // top|middle|bottom
+    fontSize:     payload.fontSize    || 38,          // px, 24-56
+    bgm: payload.bgm && payload.bgm.url ? {
+      url:    payload.bgm.url    || '',
+      start:  payload.bgm.start  || '',
+      end:    payload.bgm.end    || '',
+      volume: payload.bgm.volume || 30,
+    } : null,
+    driveFolder:  payload.driveFolder || '',          // global Drive folder for all modes
+
+    // ── screenshot_recap specific fields ───────────────────────────
     sr_timestamps:   Array.isArray(payload.sr_timestamps) ? payload.sr_timestamps : [],
     sr_audio_path:   payload.sr_audio_path   || '',
     sr_atempo:       payload.sr_atempo       || 0.85,
     sr_drive_folder: payload.sr_drive_folder || '',
-    status:     'queued',
+    sr_kb_effect:    payload.sr_kb_effect    || 'random',  // Ken Burns effect mode
+    sr_ss_quality:   payload.sr_ss_quality   || '2',       // Screenshot quality (q value)
+    sr_bgm: payload.sr_bgm && payload.sr_bgm.url ? {
+      url:    payload.sr_bgm.url    || '',
+      start:  payload.sr_bgm.start  || '',
+      end:    payload.sr_bgm.end    || '',
+      volume: payload.sr_bgm.volume || 25,
+    } : null,
+
+    extractAudio: !!payload.extractAudio,  // optional audio extract mode
+    audioExtracts: {},   // { outputIndex: { path, file, waitingForAudio, cleanedAudioPath } }
     progress:   0,
     createdAt:  Date.now(),
+    finishedAt: null,
     outputs:    [],
     error:      null,
   };
@@ -182,17 +206,31 @@ async function runJob(id) {
     clips:       job.clips,
     sources:     job.sources,     // recap mode: [{url, referer, clips:[{start,end}]}]
     recap_merge: job.recapMerge,  // true = সব clips concat করে একটা video
-    // screenshot_recap fields
+
+    // ── New fields passed to Python ──────────────────────────────
+    color_grade:  job.colorGrade,
+    sub_pos:      job.subPos,
+    font_size:    job.fontSize,
+    bgm:          job.bgm || null,        // {url, start, end, volume} or null
+    drive_folder: job.driveFolder || '',
+
+    // ── screenshot_recap fields ──────────────────────────────────
     sr_timestamps:   job.sr_timestamps   || [],
     sr_audio_path:   job.sr_audio_path   || '',
     sr_atempo:       job.sr_atempo       || 0.85,
     sr_drive_folder: job.sr_drive_folder || '',
+    sr_kb_effect:    job.sr_kb_effect    || 'random',
+    sr_ss_quality:   job.sr_ss_quality   || '2',
+    sr_bgm:          job.sr_bgm || null,  // {url, start, end, volume} or null
   };
 
   const configPath = path.join(jobDir, 'job_config.json');
   fs.writeFileSync(configPath, JSON.stringify(pyConfig, null, 2));
 
   jl.info(`🔥 Sub Burner starting (mode=${job.mode}, preset=${job.preset}, crop169=${job.crop169})`);
+  jl.info(`   Color: ${job.colorGrade} | subPos: ${job.subPos} | fontSize: ${job.fontSize}px`);
+  if (job.bgm) jl.info(`   BGM: ${job.bgm.url.slice(0, 60)} vol=${job.bgm.volume}%`);
+  if (job.driveFolder) jl.info(`   Drive: ${job.driveFolder.slice(0, 60)}`);
   if (job.mode === 'recap') {
     jl.info(`   Sources: ${job.sources.length} URL(s), recap_merge=${job.recapMerge}`);
   } else {
@@ -209,6 +247,21 @@ async function runJob(id) {
     },
   });
   activeProcs.set(id, child);
+
+  // Job-level timeout: min 30min, +10min per clip — kills stuck Python/FFmpeg
+  const clipCount = Array.isArray(job.clips) ? job.clips.length : (Array.isArray(job.sources) ? job.sources.length : 1);
+  const jobTimeoutMs = Math.max(1800, clipCount * 600) * 1000;
+  const jobTimer = setTimeout(() => {
+    jl.warn(`⏰ Sub Burner job timeout after ${Math.round(jobTimeoutMs/60000)}min — killing stuck process`);
+    try { child.kill('SIGKILL'); } catch (_) {}
+    const j = jobs[id];
+    if (j && j.status === 'running') {
+      j.status = 'failed';
+      j.error = `Job timeout after ${Math.round(jobTimeoutMs/60000)} minutes`;
+      j.finishedAt = Date.now();
+      saveStore();
+    }
+  }, jobTimeoutMs);
 
   // Parse stdout JSON lines
   let buf = '';
@@ -238,6 +291,7 @@ async function runJob(id) {
   });
 
   child.on('close', code => {
+    clearTimeout(jobTimer);
     activeProcs.delete(id);
     if (aborted.has(id)) {
       jl.warn('Job aborted by user.');
@@ -247,18 +301,17 @@ async function runJob(id) {
     const j2 = jobs[id];
     if (!j2) return;
     if (code !== 0 && j2.status === 'done') {
-      // Python emitted {type:'done'} then crashed on cleanup — treat as success
-      // but warn so the log shows the crash.
       jl.warn(`⚠ Python exited ${code} after job was already marked done — treating as success.`);
       saveStore();
     } else if (code !== 0 && j2.status !== 'failed') {
-      j2.status = 'failed';
-      j2.error  = `Python exited with code ${code}`;
+      j2.status    = 'failed';
+      j2.error     = `Python exited with code ${code}`;
+      j2.finishedAt = Date.now();
       jl.error(`❌ Python process exited: code ${code}`);
       saveStore();
     } else if (j2.status === 'running') {
-      // Python exited 0 but never emitted {type:'done'} — mark done anyway
-      j2.status = 'done';
+      j2.status    = 'done';
+      j2.finishedAt = Date.now();
       saveStore();
       jl.info('🏁 Job finished.');
     }
@@ -278,7 +331,6 @@ function handlePyEvent(id, jl, obj) {
     case 'progress': {
       job.progress = obj.pct;
       saveStore();
-      // Small milestones only (avoid spam)
       if (obj.pct % 10 === 0 || obj.stage === 'done') {
         jl.info(`⏳ ${obj.pct}% [${obj.stage}]`);
       }
@@ -290,6 +342,7 @@ function handlePyEvent(id, jl, obj) {
     }
     case 'clip_done': {
       if (obj.status === 'ready') {
+        const outputIdx = job.outputs.length;
         job.outputs.push({
           clip:  obj.index + 1,
           title: obj.title,
@@ -297,6 +350,38 @@ function handlePyEvent(id, jl, obj) {
           links: obj.links || {},
         });
         jl.info(`✅ Clip ${obj.index + 1} ready: ${obj.file}`);
+
+        // ── Audio Extract (optional) ──────────────────────────────
+        if (job.extractAudio && obj.file) {
+          const videoPath = obj.file; // Python sends full path
+          if (fs.existsSync(videoPath)) {
+            const audioOut = videoPath.replace(/\.mp4$/i, '_audio.aac');
+            jl.info(`🎵 Extracting audio for clip ${obj.index + 1}...`);
+            const { spawn: sp } = require('child_process');
+            const proc = sp('ffmpeg', [
+              '-hide_banner', '-loglevel', 'error', '-y',
+              '-i', videoPath,
+              '-vn', '-acodec', 'copy',
+              audioOut,
+            ], { stdio: 'ignore' });
+            proc.on('close', code => {
+              if (code === 0) {
+                job.audioExtracts[outputIdx] = {
+                  path: audioOut,
+                  file: path.basename(audioOut),
+                  videoPath,
+                  waitingForAudio: true,
+                  cleanedAudioPath: null,
+                };
+                saveStore();
+                jl.info(`⏸ Audio extracted, waiting for cleaned upload: ${path.basename(audioOut)}`);
+              } else {
+                jl.warn(`audio extract failed for clip ${obj.index + 1}`);
+              }
+            });
+          }
+        }
+        // ─────────────────────────────────────────────────────────
       } else {
         jl.error(`❌ Clip ${obj.index + 1} failed: ${obj.title}`);
       }
@@ -305,8 +390,9 @@ function handlePyEvent(id, jl, obj) {
     }
     case 'done': {
       if (aborted.has(id)) break;
-      job.status   = 'done';
-      job.progress = 100;
+      job.status    = 'done';
+      job.progress  = 100;
+      job.finishedAt = Date.now();
       if (Array.isArray(obj.outputs) && obj.outputs.length) {
         job.outputs = obj.outputs;
       }
@@ -315,8 +401,9 @@ function handlePyEvent(id, jl, obj) {
       break;
     }
     case 'error': {
-      job.status = 'failed';
-      job.error  = obj.msg;
+      job.status    = 'failed';
+      job.error     = obj.msg;
+      job.finishedAt = Date.now();
       jl.error(`❌ Error: ${obj.msg}`);
       saveStore();
       break;
@@ -357,4 +444,4 @@ function deleteJob(id) {
   return true;
 }
 
-module.exports = { createJob, getJob, listJobs, deleteJob };
+module.exports = { createJob, getJob, listJobs, deleteJob, saveStore };

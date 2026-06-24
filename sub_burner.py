@@ -14,6 +14,7 @@ import re
 import subprocess
 import sys
 import time
+import tempfile
 import traceback
 import urllib.request
 import urllib.parse
@@ -71,8 +72,8 @@ STYLE_PRESETS = {
         'back_colour': '&H50000000', 'outline_colour': '&H00000000',
         'spacing': 0, 'margin_lr_ratio': 0.05, 'margin_v_ratio': 0.04, 'blur': 0,
         'size_ratio_916': 0.038, 'margin_lr_ratio_916': 0.04, 'margin_v_ratio_916': 0.06,
-        'crop_169_font_size': 56,      # fixed font size in px for 9:16 mode
-        'crop_169_margin_offset': 120,  # additional margin (bottom_black + offset)
+        'crop_169_font_size': 56,
+        'crop_169_margin_offset': 120,
     },
     '2': {
         'name': 'Netflix Clean',
@@ -95,6 +96,176 @@ STYLE_PRESETS = {
         'crop_169_margin_offset': 130,
     },
 }
+
+# ── Color grading filter builder ───────────────────────────────────────────────
+
+def build_color_grade_filter(grade):
+    """Return an ffmpeg vf filter string for color grading, or '' for none/natural."""
+    grade = (grade or 'natural').lower()
+    if grade in ('none', 'natural', ''):
+        return ''
+    if grade == 'bright':
+        # Slightly brighten + increase saturation
+        return 'eq=brightness=0.06:saturation=1.15:contrast=1.05'
+    if grade == 'vivid':
+        # High saturation, slight brightness
+        return 'eq=brightness=0.04:saturation=1.4:contrast=1.08'
+    if grade == 'warm':
+        # Warm tones: boost red/green, reduce blue slightly via curves
+        return 'curves=r=0/0 0.5/0.58 1/1:g=0/0 0.5/0.52 1/1:b=0/0 0.5/0.44 1/1'
+    if grade == 'cinema':
+        # Cinematic: slight desaturation, lift shadows, lower highlights
+        return 'eq=saturation=0.85:contrast=1.12:brightness=-0.02,curves=r=0/0.05 1/0.95:g=0/0.05 1/0.95:b=0/0.08 1/0.92'
+    return ''
+
+# ── Subtitle position helper ──────────────────────────────────────────────────
+
+def sub_pos_to_align(sub_pos):
+    """Convert top/middle/bottom to ASS alignment number."""
+    mapping = {'top': 8, 'middle': 5, 'bottom': 2}
+    return mapping.get((sub_pos or 'bottom').lower(), 2)
+
+# ── BGM download helper ────────────────────────────────────────────────────────
+
+def fetch_bgm(bgm_cfg, output_dir):
+    """
+    Download BGM from YouTube URL using yt-dlp, trim to [start, end], normalize volume.
+    Returns path to processed audio file, or None on failure.
+    bgm_cfg = {url, start, end, volume}
+    """
+    if not bgm_cfg or not bgm_cfg.get('url'):
+        return None
+
+    url    = bgm_cfg['url']
+    start  = bgm_cfg.get('start', '')   # HH:MM:SS or ''
+    end    = bgm_cfg.get('end', '')     # HH:MM:SS or ''
+    volume = float(bgm_cfg.get('volume', 30)) / 100.0  # 0.0–1.0
+
+    raw_path    = os.path.join(output_dir, 'bgm_raw.%(ext)s')
+    raw_out     = os.path.join(output_dir, 'bgm_raw.mp3')
+    trimmed_out = os.path.join(output_dir, 'bgm_trimmed.mp3')
+
+    info(f'BGM: downloading from {url[:60]} …')
+    dl_cmd = [
+        'yt-dlp', '-x', '--audio-format', 'mp3',
+        '--audio-quality', '5',
+        '-o', raw_path,
+        '--no-playlist',
+        url
+    ]
+    rc = subprocess.run(dl_cmd, capture_output=True, timeout=180).returncode
+    if rc != 0 or not Path(raw_out).exists():
+        # Try alternate output name (yt-dlp may use different ext)
+        candidates = list(Path(output_dir).glob('bgm_raw.*'))
+        if candidates:
+            raw_out = str(candidates[0])
+        else:
+            warn('BGM download failed — skipping background music')
+            return None
+
+    info(f'BGM downloaded: {os.path.basename(raw_out)}')
+
+    # Build trim + volume filter
+    trim_args = []
+    if start:
+        trim_args += ['-ss', start]
+    if end:
+        trim_args += ['-to', end]
+
+    af = f'volume={volume:.3f}'
+
+    trim_cmd = [
+        'ffmpeg', '-y',
+        '-i', raw_out,
+        *trim_args,
+        '-af', af,
+        '-c:a', 'libmp3lame', '-b:a', '128k',
+        trimmed_out
+    ]
+    rc = subprocess.run(trim_cmd, capture_output=True, timeout=120).returncode
+    if rc != 0 or not Path(trimmed_out).exists():
+        warn('BGM trim/volume failed — using raw download')
+        return raw_out
+
+    info(f'BGM ready: {os.path.basename(trimmed_out)} vol={int(volume*100)}%')
+    return trimmed_out
+
+# ── Drive upload helper ────────────────────────────────────────────────────────
+
+def upload_to_drive(file_path, drive_folder_url):
+    """
+    Upload file to Google Drive folder using rclone or gdrive CLI if available.
+    Falls back to a simple Drive API upload via service account credentials.
+    Returns (success: bool, drive_url: str|None)
+    """
+    if not drive_folder_url or not drive_folder_url.strip():
+        return False, None
+    if not Path(file_path).exists():
+        warn(f'Drive upload: file not found: {file_path}')
+        return False, None
+
+    # Extract folder ID from URL
+    m = re.search(r'/folders/([a-zA-Z0-9_-]+)', drive_folder_url)
+    if not m:
+        warn(f'Drive upload: cannot parse folder ID from: {drive_folder_url}')
+        return False, None
+    folder_id = m.group(1)
+
+    # Try rclone first (if configured)
+    rclone_result = _drive_upload_rclone(file_path, folder_id)
+    if rclone_result is not None:
+        return True, rclone_result
+
+    # Try gdrive CLI (if available)
+    gdrive_result = _drive_upload_gdrive(file_path, folder_id)
+    if gdrive_result is not None:
+        return True, gdrive_result
+
+    warn('Drive upload: neither rclone nor gdrive CLI available — skipping Drive upload')
+    return False, None
+
+def _drive_upload_rclone(file_path, folder_id):
+    """Try rclone upload. Returns drive URL string or None."""
+    try:
+        result = subprocess.run(['which', 'rclone'], capture_output=True, timeout=5)
+        if result.returncode != 0:
+            return None
+    except Exception:
+        return None
+    try:
+        dest = f'drive:{folder_id}/{os.path.basename(file_path)}'
+        rc = subprocess.run(
+            ['rclone', 'copy', file_path, f'drive:{folder_id}', '--drive-use-trash=false'],
+            capture_output=True, timeout=600
+        ).returncode
+        if rc == 0:
+            info(f'rclone Drive upload OK → folder {folder_id}')
+            return f'https://drive.google.com/drive/folders/{folder_id}'
+        return None
+    except Exception as e:
+        warn(f'rclone upload error: {e}')
+        return None
+
+def _drive_upload_gdrive(file_path, folder_id):
+    """Try gdrive CLI upload. Returns drive URL string or None."""
+    try:
+        result = subprocess.run(['which', 'gdrive'], capture_output=True, timeout=5)
+        if result.returncode != 0:
+            return None
+    except Exception:
+        return None
+    try:
+        r = subprocess.run(
+            ['gdrive', 'files', 'upload', '--parent', folder_id, file_path],
+            capture_output=True, text=True, timeout=600
+        )
+        if r.returncode == 0:
+            info(f'gdrive upload OK → folder {folder_id}')
+            return f'https://drive.google.com/drive/folders/{folder_id}'
+        return None
+    except Exception as e:
+        warn(f'gdrive upload error: {e}')
+        return None
 
 # ── utilities ─────────────────────────────────────────────────────────────────
 
@@ -166,13 +337,25 @@ def build_header(play_w, play_h, font_family, font_size, primary_colour,
         '[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n'
     )
 
-def srt_text_to_ass(srt_text, ass_path, play_w, play_h, preset_key, crop_169=False):
-    """Convert SRT text → ASS file. Returns the font_key used."""
+def srt_text_to_ass(srt_text, ass_path, play_w, play_h, preset_key, crop_169=False,
+                    sub_pos=None, custom_font_size=None):
+    """
+    Convert SRT text → ASS file.
+    sub_pos: 'top'|'middle'|'bottom' — overrides preset position.
+    custom_font_size: int px — overrides preset font size when not in crop_169 mode.
+    Returns the font_key used.
+    """
     preset    = STYLE_PRESETS.get(preset_key, STYLE_PRESETS['1'])
     font_key  = preset['font_key']
     font_meta = FONTS.get(font_key, FONTS['1'])
     color_hex = COLORS[preset['color_key']][1]
-    align     = POSITIONS[preset['position_key']][1]
+
+    # Subtitle position — sub_pos overrides preset
+    if sub_pos:
+        align = sub_pos_to_align(sub_pos)
+    else:
+        align = POSITIONS[preset['position_key']][1]
+
     # Use 9:16 ratios when crop_169 is active
     if crop_169 and preset.get('size_ratio_916'):
         size_ratio    = preset['size_ratio_916']
@@ -182,18 +365,23 @@ def srt_text_to_ass(srt_text, ass_path, play_w, play_h, preset_key, crop_169=Fal
         size_ratio    = SIZES[preset['size_key']][1]
         margin_lr_ratio = preset['margin_lr_ratio']
         margin_v_ratio  = preset['margin_v_ratio']
+
     font_size = max(20, int(round(play_h * size_ratio)))
+
+    # Override font size if custom_font_size provided (only in non-crop mode)
+    if custom_font_size and not crop_169:
+        font_size = max(20, int(custom_font_size))
+
     if crop_169:
-        # 1:1 crop + 9:16 pad – subtitle at bottom, never cut off
-        padded_h = int(round(play_w * 16 / 9))
+        padded_h     = int(round(play_w * 16 / 9))
         video_h_in_pad = play_w
         bottom_black = (padded_h - video_h_in_pad) // 2
-        # Use preset-specific font size and margin offset
         font_size = preset.get('crop_169_font_size', 40)
-        margin_v = bottom_black + preset.get('crop_169_margin_offset', 70)
-        play_h = padded_h
+        margin_v  = bottom_black + preset.get('crop_169_margin_offset', 70)
+        play_h    = padded_h
     else:
         margin_v = max(20, int(round(play_h * margin_v_ratio)))
+
     preset = dict(preset)
     preset['_margin_lr_ratio_active'] = margin_lr_ratio
 
@@ -267,6 +455,7 @@ def ffprobe_meta(url, referer=''):
         'ffprobe', '-v', 'error',
         '-user_agent', 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
         '-headers', headers_val,
+        *extra_m3u8_args(url),
         '-print_format', 'json', '-show_streams', '-show_format', url,
     ]
     try:
@@ -311,9 +500,14 @@ def run_ffmpeg(cmd, duration=None, stage='render'):
 
 # ── Video filter builder ──────────────────────────────────────────────────────
 
-def build_vf(ass_path, crop_169, clip_title=''):
-    """Return the -vf filter string. ass_path=None means no subtitle."""
+def build_vf(ass_path, crop_169, clip_title='', color_grade='natural'):
+    """
+    Return the -vf filter string.
+    ass_path=None means no subtitle.
+    color_grade: none|natural|bright|vivid|warm|cinema
+    """
     has_sub = ass_path is not None
+    cg_filter = build_color_grade_filter(color_grade)
 
     def make_sub_filter():
         esc_ass   = esc_filter(str(ass_path))
@@ -323,7 +517,7 @@ def build_vf(ass_path, crop_169, clip_title=''):
     def make_title_filter(y_pos):
         font_path = str(FONTS_DIR / 'SolaimanLipi.ttf')
         esc_font  = esc_filter(font_path)
-        safe = clip_title.replace("'", "\\\'").replace(':', '\\:').replace('[', '\\[').replace(']', '\\]')
+        safe = clip_title.replace("'", "\\'").replace(':', '\\:').replace('[', '\\[').replace(']', '\\]')
         return (
             f"drawtext=fontfile='{esc_font}':text='{safe}'"
             f":fontsize=48:fontcolor=white:borderw=3:bordercolor=black"
@@ -336,13 +530,15 @@ def build_vf(ass_path, crop_169, clip_title=''):
         scale = "scale='trunc(iw/2)*2':'trunc(ih/2)*2'"
         base  = f"{crop},{pad},{scale}"
         parts = [base]
-        if clip_title: parts.append(make_title_filter(60))
-        if has_sub:    parts.append(make_sub_filter())
+        if cg_filter:    parts.append(cg_filter)
+        if clip_title:   parts.append(make_title_filter(60))
+        if has_sub:      parts.append(make_sub_filter())
         return ','.join(parts)
     else:
         parts = []
-        if clip_title: parts.append(make_title_filter(40))
-        if has_sub:    parts.append(make_sub_filter())
+        if cg_filter:    parts.append(cg_filter)
+        if clip_title:   parts.append(make_title_filter(40))
+        if has_sub:      parts.append(make_sub_filter())
         return ','.join(parts) if parts else 'null'
 
 # ── Render helpers ────────────────────────────────────────────────────────────
@@ -353,40 +549,113 @@ def make_headers_val(referer):
         val += f'Referer: {referer}\r\nOrigin: {referer}\r\n'
     return val
 
-def render_full(video_url, referer, ass_path, out_path, duration, crop_169):
+def is_m3u8(url):
+    return '.m3u8' in (url or '').lower()
+
+def extra_m3u8_args(url):
+    """Return extra ffmpeg args needed for HLS/m3u8 streams."""
+    if is_m3u8(url):
+        return ['-allowed_extensions', 'ALL']
+    return []
+
+def build_audio_mix_args(bgm_path):
+    """
+    Return extra ffmpeg input + filter_complex args for BGM mixing.
+    bgm_path: path to pre-processed BGM audio file (already trimmed + volume adjusted).
+    Returns (extra_inputs, audio_filter_args) both as lists.
+    """
+    if not bgm_path or not Path(bgm_path).exists():
+        return [], []
+    # Mix original audio with BGM: amix with original taking priority
+    extra_inputs = ['-i', bgm_path]
+    audio_filter = [
+        '-filter_complex', '[1:a]aloop=loop=-1:size=2e+09[bgmloop];[0:a][bgmloop]amix=inputs=2:duration=first:weights=1 1[aout]',
+        '-map', '0:v', '-map', '[aout]',
+    ]
+    return extra_inputs, audio_filter
+
+def render_full(video_url, referer, ass_path, out_path, duration, crop_169,
+                color_grade='natural', bgm_path=None):
     proxy = os.environ.get('FFMPEG_HTTP_PROXY', '')
     proxy_args = ['-http_proxy', proxy] if proxy else []
-    cmd = [
-        'ffmpeg', '-y',
-        '-user_agent', 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
-        '-headers', make_headers_val(referer),
-        *proxy_args,
-        '-i', video_url,
-        '-vf', build_vf(ass_path, crop_169),
-        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',
-        '-c:a', 'aac', '-b:a', '128k',
-        '-movflags', '+faststart',
-        out_path,
-    ]
+    vf = build_vf(ass_path, crop_169, color_grade=color_grade)
+
+    bgm_inputs, bgm_audio = build_audio_mix_args(bgm_path)
+
+    if bgm_audio:
+        cmd = [
+            'ffmpeg', '-y',
+            '-user_agent', 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
+            '-headers', make_headers_val(referer),
+            *extra_m3u8_args(video_url),
+            *proxy_args,
+            '-i', video_url,
+            *bgm_inputs,
+            '-vf', vf,
+            *bgm_audio,
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart',
+            out_path,
+        ]
+    else:
+        cmd = [
+            'ffmpeg', '-y',
+            '-user_agent', 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
+            '-headers', make_headers_val(referer),
+            *extra_m3u8_args(video_url),
+            *proxy_args,
+            '-i', video_url,
+            '-vf', vf,
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart',
+            out_path,
+        ]
     return run_ffmpeg(cmd, duration, 'render')
 
-def render_clip(video_url, referer, ass_path, out_path, start_sec, clip_dur, crop_169, clip_title=''):
+def render_clip(video_url, referer, ass_path, out_path, start_sec, clip_dur, crop_169,
+                clip_title='', color_grade='natural', bgm_path=None):
     proxy = os.environ.get('FFMPEG_HTTP_PROXY', '')
     proxy_args = ['-http_proxy', proxy] if proxy else []
-    cmd = [
-        'ffmpeg', '-y',
-        '-user_agent', 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
-        '-headers', make_headers_val(referer),
-        *proxy_args,
-        '-ss', str(start_sec),
-        '-i', video_url,
-        '-t', str(clip_dur),
-        '-vf', build_vf(ass_path, crop_169),
-        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',
-        '-c:a', 'aac', '-b:a', '128k',
-        '-movflags', '+faststart',
-        out_path,
-    ]
+    vf = build_vf(ass_path, crop_169, clip_title=clip_title, color_grade=color_grade)
+
+    bgm_inputs, bgm_audio = build_audio_mix_args(bgm_path)
+
+    if bgm_audio:
+        cmd = [
+            'ffmpeg', '-y',
+            '-user_agent', 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
+            '-headers', make_headers_val(referer),
+            *extra_m3u8_args(video_url),
+            *proxy_args,
+            '-ss', str(start_sec),
+            '-i', video_url,
+            '-t', str(clip_dur),
+            *bgm_inputs,
+            '-vf', vf,
+            *bgm_audio,
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart',
+            out_path,
+        ]
+    else:
+        cmd = [
+            'ffmpeg', '-y',
+            '-user_agent', 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
+            '-headers', make_headers_val(referer),
+            *extra_m3u8_args(video_url),
+            *proxy_args,
+            '-ss', str(start_sec),
+            '-i', video_url,
+            '-t', str(clip_dur),
+            '-vf', vf,
+            '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '22',
+            '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart',
+            out_path,
+        ]
     return run_ffmpeg(cmd, clip_dur, 'clip')
 
 # ── Upload helpers ────────────────────────────────────────────────────────────
@@ -507,7 +776,8 @@ def upload_youtube(file_path, title, access_token):
         err(f'YouTube upload failed: {e}')
         return None
 
-def do_uploads(file_path, title, uploads_cfg):
+def do_uploads(file_path, title, uploads_cfg, drive_folder=''):
+    """Upload to all configured targets. Returns links dict including drive status."""
     links = {}
     tg = uploads_cfg.get('telegram', {})
     if tg.get('enabled') and tg.get('bot_token') and tg.get('chat_id'):
@@ -518,6 +788,18 @@ def do_uploads(file_path, title, uploads_cfg):
     yt = uploads_cfg.get('youtube', {})
     if yt.get('enabled') and yt.get('access_token'):
         links['youtube'] = upload_youtube(file_path, title, yt['access_token'])
+
+    # Google Drive upload
+    if drive_folder and drive_folder.strip():
+        info(f'Uploading to Google Drive …')
+        ok, drive_url = upload_to_drive(file_path, drive_folder)
+        if ok:
+            links['drive_ok'] = drive_url or drive_folder
+            info(f'Drive upload OK: {drive_url}')
+        else:
+            links['drive_fail'] = True
+            warn('Drive upload failed')
+
     return links
 
 # ── timestamp parser ──────────────────────────────────────────────────────────
@@ -545,7 +827,7 @@ def main():
     mode        = cfg.get('mode', 'full')
     video_url   = cfg.get('video_url', '')
     referer     = cfg.get('referer', '')
-    srt_path    = cfg.get('srt_path')          # optional
+    srt_path    = cfg.get('srt_path')
     preset_key  = str(cfg.get('preset', '1'))
     crop_169    = bool(cfg.get('crop_169', False))
     output_dir  = cfg['output_dir']
@@ -553,8 +835,15 @@ def main():
     title       = cfg.get('title', 'SubBurner Video')
     uploads_cfg = cfg.get('uploads', {})
     clips       = cfg.get('clips', [])
-    sources     = cfg.get('sources', [])       # recap mode
+    sources     = cfg.get('sources', [])
     recap_merge = bool(cfg.get('recap_merge', True))
+
+    # ── New fields ──────────────────────────────────────────────────────────
+    color_grade  = cfg.get('color_grade', 'natural')
+    sub_pos      = cfg.get('sub_pos', 'bottom')
+    custom_fs    = cfg.get('font_size', None)   # custom font size in px
+    bgm_cfg      = cfg.get('bgm', None)          # {url, start, end, volume} or null
+    drive_folder = cfg.get('drive_folder', '')
 
     Path(output_dir).mkdir(parents=True, exist_ok=True)
 
@@ -571,20 +860,31 @@ def main():
     preset = STYLE_PRESETS.get(preset_key, STYLE_PRESETS['1'])
     ensure_font(preset['font_key'])
 
+    info(f'Color grade: {color_grade} | Sub position: {sub_pos} | Font size: {custom_fs or "auto"}px')
+    if bgm_cfg: info(f'BGM enabled: {bgm_cfg.get("url","")[:60]} vol={bgm_cfg.get("volume",30)}%')
+    if drive_folder: info(f'Drive folder: {drive_folder[:60]}')
+
+    # ── Pre-fetch BGM if needed ────────────────────────────────────────────
+    bgm_path = None
+    if mode in ('full', 'clip', 'recap') and bgm_cfg and bgm_cfg.get('url'):
+        bgm_path = fetch_bgm(bgm_cfg, output_dir)
+
     if mode == 'full':
         # ── Full Render ──────────────────────────────────────────────────────
         info(f'Probing video …')
         play_w, play_h, duration = ffprobe_meta(video_url, referer)
         info(f'Video: {play_w}x{play_h}, duration={fmt_time(duration)}')
-        info(f'=== Full Render | preset={preset["name"]} | crop_169={crop_169} ===')
+        info(f'=== Full Render | preset={preset["name"]} | crop_169={crop_169} | color={color_grade} ===')
         ass_path = os.path.join(output_dir, 'subtitle.ass')
         if srt_text:
-            srt_text_to_ass(srt_text, ass_path, play_w, play_h, preset_key, crop_169=crop_169)
+            srt_text_to_ass(srt_text, ass_path, play_w, play_h, preset_key,
+                            crop_169=crop_169, sub_pos=sub_pos, custom_font_size=custom_fs)
         else:
             ass_path = None
         out_path = os.path.join(output_dir, f'{job_id}_output.mp4')
         info('Starting FFmpeg …')
-        rc = render_full(video_url, referer, ass_path, out_path, duration, crop_169)
+        rc = render_full(video_url, referer, ass_path, out_path, duration, crop_169,
+                         color_grade=color_grade, bgm_path=bgm_path)
         if rc != 0 or not os.path.exists(out_path):
             err('FFmpeg render failed (non-zero exit)')
             emit({'type': 'error', 'msg': 'FFmpeg render failed'})
@@ -593,7 +893,7 @@ def main():
         info(f'Render done: {size_mb} MB')
         progress(95, 'render_done')
         info('Starting uploads …')
-        links = do_uploads(out_path, title, uploads_cfg)
+        links = do_uploads(out_path, title, uploads_cfg, drive_folder=drive_folder)
         progress(100, 'done')
         emit({'type': 'done', 'outputs': [{'file': os.path.basename(out_path), 'links': links}]})
 
@@ -603,7 +903,7 @@ def main():
         play_w, play_h, duration = ffprobe_meta(video_url, referer)
         info(f'Video: {play_w}x{play_h}, duration={fmt_time(duration)}')
         total = len(clips)
-        info(f'=== Clip Mode: {total} clips | preset={preset["name"]} | crop_169={crop_169} ===')
+        info(f'=== Clip Mode: {total} clips | preset={preset["name"]} | crop_169={crop_169} | color={color_grade} ===')
         results = []
         for i, clip in enumerate(clips):
             clip_title  = clip.get('title', f'Clip {i + 1}')
@@ -619,12 +919,14 @@ def main():
                 clip_srt_path = os.path.join(output_dir, f'clip_{i+1:02d}.srt')
                 Path(clip_srt_path).write_text(clipped_srt, encoding='utf-8')
                 clip_ass_path = os.path.join(output_dir, f'clip_{i+1:02d}.ass')
-                srt_text_to_ass(clipped_srt, clip_ass_path, play_w, play_h, preset_key, crop_169=crop_169)
+                srt_text_to_ass(clipped_srt, clip_ass_path, play_w, play_h, preset_key,
+                                crop_169=crop_169, sub_pos=sub_pos, custom_font_size=custom_fs)
 
             safe = re.sub(r'[\\/:"*?<>|\n\r\t]', ' ', clip_title).strip()[:60] or f'clip{i+1}'
             out_name = f'{job_id}_clip{i+1:02d}_{safe}.mp4'
             out_path = os.path.join(output_dir, out_name)
-            rc = render_clip(video_url, referer, clip_ass_path, out_path, start_sec, clip_dur, crop_169, clip_title)
+            rc = render_clip(video_url, referer, clip_ass_path, out_path, start_sec, clip_dur, crop_169,
+                             clip_title=clip_title, color_grade=color_grade, bgm_path=bgm_path)
 
             if rc != 0 or not os.path.exists(out_path):
                 err(f'Clip {i+1} render failed')
@@ -637,7 +939,7 @@ def main():
             base_pct = int((i + 1) / total * 85)
             progress(base_pct, f'clip_{i+1}_rendered')
 
-            links = do_uploads(out_path, clip_title, uploads_cfg)
+            links = do_uploads(out_path, clip_title, uploads_cfg, drive_folder=drive_folder)
             results.append({'clip': i + 1, 'title': clip_title, 'file': out_name, 'links': links})
             emit({'type': 'clip_done', 'index': i, 'status': 'ready',
                   'title': clip_title, 'file': out_name, 'links': links})
@@ -648,9 +950,11 @@ def main():
 
     elif mode == 'recap':
         # ── নাটক রিক্যাপ Mode ─────────────────────────────────────────────────
-        # sources = [{url, referer, clips:[{start,end}]}]
-        # সব sources থেকে clips কেটে concat → একটাই final video
-        info(f'=== নাটক রিক্যাপ Mode | {len(sources)} source(s) | preset={preset["name"]} | crop_169={crop_169} ===')
+        info(f'=== নাটক রিক্যাপ Mode | {len(sources)} source(s) | preset={preset["name"]} | color={color_grade} ===')
+
+        # Recap-specific BGM override if provided
+        recap_bgm_cfg = cfg.get('bgm', bgm_cfg)
+        recap_bgm_path = bgm_path  # already fetched above if same bgm_cfg
 
         segment_paths = []
         total_clips   = sum(len(s.get('clips', [])) for s in sources)
@@ -665,8 +969,6 @@ def main():
                 continue
 
             info(f'--- Source {si+1}/{len(sources)}: {src_url[:80]} ({len(src_clips)} clip(s)) ---')
-
-            # Probe এই source এর video
             info(f'Probing source {si+1} …')
             try:
                 play_w, play_h, src_dur = ffprobe_meta(src_url, src_referer)
@@ -682,17 +984,18 @@ def main():
                 seg_label = f's{si+1}_c{ci+1}'
                 info(f'  Clip {seg_label}: {clip["start"]}→{clip["end"]} ({fmt_time(clip_dur)})')
 
-                # SRT trim (optional)
                 seg_ass_path = None
                 if srt_text:
                     seg_srt  = clip_srt(srt_text, start_sec, end_sec)
                     seg_srt_path = os.path.join(output_dir, f'seg_{seg_label}.srt')
                     Path(seg_srt_path).write_text(seg_srt, encoding='utf-8')
                     seg_ass_path = os.path.join(output_dir, f'seg_{seg_label}.ass')
-                    srt_text_to_ass(seg_srt, seg_ass_path, play_w, play_h, preset_key, crop_169=crop_169)
+                    srt_text_to_ass(seg_srt, seg_ass_path, play_w, play_h, preset_key,
+                                    crop_169=crop_169, sub_pos=sub_pos, custom_font_size=custom_fs)
 
                 seg_out = os.path.join(output_dir, f'seg_{seg_label}.mp4')
-                rc = render_clip(src_url, src_referer, seg_ass_path, seg_out, start_sec, clip_dur, crop_169)
+                rc = render_clip(src_url, src_referer, seg_ass_path, seg_out, start_sec, clip_dur, crop_169,
+                                 color_grade=color_grade, bgm_path=None)  # BGM added after concat
 
                 if rc != 0 or not os.path.exists(seg_out):
                     err(f'Segment {seg_label} render failed — skip')
@@ -711,7 +1014,7 @@ def main():
             emit({'type': 'error', 'msg': 'No segments rendered successfully'})
             return
 
-        # সব segments concat করো → একটাই final video
+        # Concat all segments
         info(f'🎬 Concat করা হচ্ছে {len(segment_paths)}টা segment → একটা video …')
         progress(82, 'concat')
 
@@ -720,18 +1023,51 @@ def main():
             for sp in segment_paths:
                 cf.write(f"file '{sp}'\n")
 
-        final_out = os.path.join(output_dir, f'{job_id}_recap.mp4')
-        concat_cmd = [
-            'ffmpeg', '-y',
-            '-f', 'concat', '-safe', '0',
-            '-i', concat_list_path,
-            '-c', 'copy',
-            final_out,
-        ]
-        rc = run_ffmpeg(concat_cmd, None, 'concat')
+        # If BGM provided, mix after concat; otherwise direct copy
+        if recap_bgm_path and Path(recap_bgm_path).exists():
+            concat_raw = os.path.join(output_dir, f'{job_id}_recap_raw.mp4')
+            concat_cmd = [
+                'ffmpeg', '-y',
+                '-f', 'concat', '-safe', '0',
+                '-i', concat_list_path,
+                '-c', 'copy',
+                concat_raw,
+            ]
+            rc = run_ffmpeg(concat_cmd, None, 'concat')
+            if rc != 0 or not Path(concat_raw).exists():
+                err('FFmpeg concat failed')
+                emit({'type': 'error', 'msg': 'Concat failed'})
+                return
+            # Now mix BGM
+            final_out = os.path.join(output_dir, f'{job_id}_recap.mp4')
+            info('Mixing BGM into recap …')
+            bgm_inputs, bgm_audio = build_audio_mix_args(recap_bgm_path)
+            mix_cmd = [
+                'ffmpeg', '-y',
+                '-i', concat_raw,
+                *bgm_inputs,
+                *bgm_audio,
+                '-c:v', 'copy',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-movflags', '+faststart',
+                final_out,
+            ]
+            rc = run_ffmpeg(mix_cmd, None, 'bgm_mix')
+            try: os.remove(concat_raw)
+            except: pass
+        else:
+            final_out = os.path.join(output_dir, f'{job_id}_recap.mp4')
+            concat_cmd = [
+                'ffmpeg', '-y',
+                '-f', 'concat', '-safe', '0',
+                '-i', concat_list_path,
+                '-c', 'copy',
+                final_out,
+            ]
+            rc = run_ffmpeg(concat_cmd, None, 'concat')
 
         if rc != 0 or not os.path.exists(final_out):
-            err('FFmpeg concat failed')
+            err('FFmpeg concat/mix failed')
             emit({'type': 'error', 'msg': 'Concat failed'})
             return
 
@@ -739,28 +1075,26 @@ def main():
         info(f'✅ Final recap video ready: {size_mb} MB')
         progress(92, 'concat_done')
 
-        # Cleanup segments
         for sp in segment_paths:
             try: os.remove(sp)
             except: pass
 
         info('Starting uploads …')
-        links = do_uploads(final_out, title, uploads_cfg)
+        links = do_uploads(final_out, title, uploads_cfg, drive_folder=drive_folder)
         progress(100, 'done')
         emit({'type': 'done', 'outputs': [{'file': os.path.basename(final_out), 'links': links}]})
 
     elif mode == 'screenshot_recap':
         # ── Screenshot Recap Mode ─────────────────────────────────────────────
-        # timestamps[] থেকে FFmpeg দিয়ে screenshot নেয়
-        # Audio (MP3) frontend থেকে generate করে path পাঠায়
-        # Audio duration / screenshot count = প্রতিটা screenshot কতক্ষণ দেখাবে
-        # Effects: Ken Burns (normal), Cross Dissolve (emotional), Fade in/out (episode start/end)
-        info(f'=== Screenshot Recap Mode | {len(sources)} source(s) ===')
+        info(f'=== Screenshot Recap Mode ===')
 
-        # Config fields
-        sr_timestamps  = cfg.get('sr_timestamps', [])   # [{time:"HH:MM:SS", type:"normal"|"emotional"|"start"|"end"}]
-        sr_audio_path  = cfg.get('sr_audio_path', '')   # server-side path to generated mp3
+        sr_timestamps  = cfg.get('sr_timestamps', [])
+        sr_audio_path  = cfg.get('sr_audio_path', '')
         sr_atempo      = float(cfg.get('sr_atempo', 0.85))
+        sr_drive_folder = cfg.get('sr_drive_folder', '') or drive_folder  # fallback to global
+        sr_kb_effect   = cfg.get('sr_kb_effect', 'random')  # random|zoom_in|zoom_out|pan_left|pan_right|none
+        sr_ss_quality  = str(cfg.get('sr_ss_quality', '2'))  # ffmpeg -q:v value
+        sr_bgm_cfg     = cfg.get('sr_bgm', None)
 
         src_url     = sources[0].get('url', video_url)    if sources else video_url
         src_referer = sources[0].get('referer', referer)  if sources else referer
@@ -775,7 +1109,7 @@ def main():
             emit({'type': 'error', 'msg': 'audio file not found on server'})
             return
 
-        # ── Step 1: Get audio duration ────────────────────────────────────────
+        # Step 1: Get audio duration
         info('Getting audio duration …')
         try:
             probe_r = subprocess.run(
@@ -790,12 +1124,10 @@ def main():
             emit({'type': 'error', 'msg': 'Cannot read audio duration'})
             return
 
-        # Apply atempo to audio (speed control)
-        # We create a speed-adjusted audio first
+        # Apply atempo
         sped_audio_path = os.path.join(output_dir, 'audio_sped.mp3')
         info(f'Applying atempo={sr_atempo} to audio …')
         atempo_filter = f'atempo={sr_atempo}'
-        # ffmpeg atempo only supports 0.5-2.0, chain for extreme values
         if sr_atempo < 0.5:
             atempo_filter = f'atempo=0.5,atempo={sr_atempo/0.5:.4f}'
         elif sr_atempo > 2.0:
@@ -812,7 +1144,6 @@ def main():
             warn('atempo failed, using original audio')
             sped_audio_path = sr_audio_path
 
-        # Re-probe sped audio duration
         try:
             probe_r2 = subprocess.run(
                 ['ffprobe', '-v', 'quiet', '-show_entries', 'format=duration',
@@ -822,9 +1153,9 @@ def main():
             audio_dur = float(probe_r2.stdout.strip())
             info(f'Sped audio duration: {fmt_time(audio_dur)}')
         except Exception:
-            pass  # keep original dur
+            pass
 
-        # ── Step 2: Take screenshots via FFmpeg ───────────────────────────────
+        # Step 2: Take screenshots via FFmpeg
         total_ts = len(sr_timestamps)
         sec_per_shot = audio_dur / total_ts
         info(f'Timestamps: {total_ts} | sec/screenshot: {sec_per_shot:.2f}s')
@@ -835,26 +1166,26 @@ def main():
 
         screenshot_paths = []
         for i, ts_item in enumerate(sr_timestamps):
-            ts_str   = ts_item if isinstance(ts_item, str) else ts_item.get('time', '00:00:00')
-            ts_type  = 'normal' if isinstance(ts_item, str) else ts_item.get('type', 'normal')
-            ss_path  = os.path.join(output_dir, f'shot_{i:04d}.png')
+            ts_str  = ts_item if isinstance(ts_item, str) else ts_item.get('time', '00:00:00')
+            ts_type = 'normal' if isinstance(ts_item, str) else ts_item.get('type', 'normal')
+            ss_path = os.path.join(output_dir, f'shot_{i:04d}.png')
 
             info(f'Screenshot {i+1}/{total_ts}: {ts_str} (type={ts_type})')
             shot_cmd = [
                 'ffmpeg', '-y',
                 '-user_agent', 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36',
                 '-headers', headers_val,
+                *extra_m3u8_args(src_url),
                 *proxy_args,
                 '-ss', ts_str,
                 '-i', src_url,
                 '-vframes', '1',
-                '-q:v', '2',
+                '-q:v', sr_ss_quality,
                 ss_path
             ]
             rc = subprocess.run(shot_cmd, capture_output=True, timeout=60).returncode
             if rc != 0 or not Path(ss_path).exists():
                 warn(f'Screenshot {i+1} failed, creating black frame …')
-                # Create black frame fallback
                 fallback_cmd = [
                     'ffmpeg', '-y', '-f', 'lavfi', '-i', 'color=black:s=1280x720:r=1',
                     '-vframes', '1', ss_path
@@ -870,7 +1201,7 @@ def main():
             emit({'type': 'error', 'msg': 'Screenshot capture failed'})
             return
 
-        # ── Step 3: Get screenshot dimensions ────────────────────────────────
+        # Step 3: Get screenshot dimensions
         try:
             dim_r = subprocess.run(
                 ['ffprobe', '-v', 'error', '-select_streams', 'v:0',
@@ -884,43 +1215,84 @@ def main():
             shot_w, shot_h = 1280, 720
         info(f'Screenshot size: {shot_w}x{shot_h}')
 
-        # ── Step 4: Build animated video from screenshots ─────────────────────
-        # Each screenshot becomes a clip with its effect applied
-        # Then all clips are concatenated with audio
+        # Step 4: Build animated video from screenshots
         info('Building animated screenshot clips …')
         progress(52, 'building_clips')
+
+        import random as _random
+
+        def pick_kb_effect(ts_type, effect_mode):
+            """Pick zoompan effect based on ts_type and global effect_mode."""
+            if effect_mode == 'none':
+                return 'static'
+            if effect_mode != 'random':
+                return effect_mode
+            # random pick for normal scenes
+            if ts_type in ('start', 'end', 'emotional'):
+                return ts_type
+            return _random.choice(['zoom_in', 'zoom_out', 'pan_left', 'pan_right'])
 
         seg_clips = []
 
         for i, (ss_path, ts_type) in enumerate(screenshot_paths):
             seg_out = os.path.join(output_dir, f'seg_{i:04d}.mp4')
             dur     = sec_per_shot
+            total_frames = int(dur * 25)
 
-            # Build video filter based on scene type
-            if ts_type in ('start',):
-                # Fade in at episode start
+            chosen = pick_kb_effect(ts_type, sr_kb_effect)
+
+            if chosen == 'start' or ts_type == 'start':
                 vf = (
-                    f"zoompan=z='1':x='0':y='0':d={int(dur*25)}:s={shot_w}x{shot_h}:fps=25,"
+                    f"zoompan=z='1':x='0':y='0':d={total_frames}:s={shot_w}x{shot_h}:fps=25,"
                     f"fade=t=in:st=0:d=0.8"
                 )
-            elif ts_type in ('end',):
-                # Fade out at episode end
+            elif chosen == 'end' or ts_type == 'end':
                 vf = (
-                    f"zoompan=z='1':x='0':y='0':d={int(dur*25)}:s={shot_w}x{shot_h}:fps=25,"
+                    f"zoompan=z='1':x='0':y='0':d={total_frames}:s={shot_w}x{shot_h}:fps=25,"
                     f"fade=t=out:st={max(0, dur-0.8):.2f}:d=0.8"
                 )
-            elif ts_type == 'emotional':
-                # Cross dissolve — we fade in AND out (dissolve between shots)
-                mid = dur / 2
+            elif chosen == 'emotional' or ts_type == 'emotional':
                 vf = (
-                    f"zoompan=z='1':x='0':y='0':d={int(dur*25)}:s={shot_w}x{shot_h}:fps=25,"
+                    f"zoompan=z='1':x='0':y='0':d={total_frames}:s={shot_w}x{shot_h}:fps=25,"
                     f"fade=t=in:st=0:d=0.5,"
                     f"fade=t=out:st={max(0, dur-0.5):.2f}:d=0.5"
                 )
+            elif chosen == 'static':
+                vf = (
+                    f"zoompan=z='1':x='0':y='0':d={total_frames}:s={shot_w}x{shot_h}:fps=25"
+                )
+            elif chosen == 'zoom_out':
+                vf = (
+                    f"zoompan="
+                    f"z='max(1.0,1.08-0.0003*on)':"
+                    f"x='iw/2-(iw/zoom/2)':"
+                    f"y='ih/2-(ih/zoom/2)':"
+                    f"d={total_frames}:"
+                    f"s={shot_w}x{shot_h}:"
+                    f"fps=25"
+                )
+            elif chosen == 'pan_left':
+                vf = (
+                    f"zoompan="
+                    f"z='1.04':"
+                    f"x='iw/zoom/2+{shot_w}*0.03*on/{total_frames}':"
+                    f"y='ih/2-(ih/zoom/2)':"
+                    f"d={total_frames}:"
+                    f"s={shot_w}x{shot_h}:"
+                    f"fps=25"
+                )
+            elif chosen == 'pan_right':
+                vf = (
+                    f"zoompan="
+                    f"z='1.04':"
+                    f"x='iw/2-(iw/zoom/2)-{shot_w}*0.03*on/{total_frames}':"
+                    f"y='ih/2-(ih/zoom/2)':"
+                    f"d={total_frames}:"
+                    f"s={shot_w}x{shot_h}:"
+                    f"fps=25"
+                )
             else:
-                # Normal scenes: Ken Burns — slow zoom in + slight pan
-                # z from 1.0 to 1.08, pan slightly right
-                total_frames = int(dur * 25)
+                # Default: zoom_in (original behavior)
                 vf = (
                     f"zoompan="
                     f"z='min(zoom+0.0003,1.08)':"
@@ -965,7 +1337,7 @@ def main():
             emit({'type': 'error', 'msg': 'Animation failed'})
             return
 
-        # ── Step 5: Concat video segments ─────────────────────────────────────
+        # Step 5: Concat video segments
         info(f'Concatenating {len(seg_clips)} segments …')
         progress(83, 'concat')
 
@@ -988,21 +1360,44 @@ def main():
             emit({'type': 'error', 'msg': 'Video concat failed'})
             return
 
-        # ── Step 6: Mix audio into final video ────────────────────────────────
+        # Step 6: Mix narration audio + optional BGM into final video
         info('Mixing audio into final video …')
         progress(88, 'mixing')
 
         final_out = os.path.join(output_dir, f'{job_id}_screenshot_recap.mp4')
-        mix_cmd = [
-            'ffmpeg', '-y',
-            '-i', concat_video,
-            '-i', sped_audio_path,
-            '-c:v', 'copy',
-            '-c:a', 'aac', '-b:a', '128k',
-            '-shortest',
-            '-movflags', '+faststart',
-            final_out
-        ]
+
+        # Fetch SR BGM if provided
+        sr_bgm_path = None
+        if sr_bgm_cfg and sr_bgm_cfg.get('url'):
+            sr_bgm_path = fetch_bgm(sr_bgm_cfg, output_dir)
+
+        if sr_bgm_path and Path(sr_bgm_path).exists():
+            # Mix narration (primary) + BGM (secondary)
+            mix_cmd = [
+                'ffmpeg', '-y',
+                '-i', concat_video,
+                '-i', sped_audio_path,
+                '-i', sr_bgm_path,
+                '-filter_complex',
+                '[2:a]aloop=loop=-1:size=2e+09[bgmloop];[1:a][bgmloop]amix=inputs=2:duration=first:weights=3 1[aout]',
+                '-map', '0:v', '-map', '[aout]',
+                '-c:v', 'copy',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-shortest',
+                '-movflags', '+faststart',
+                final_out
+            ]
+        else:
+            mix_cmd = [
+                'ffmpeg', '-y',
+                '-i', concat_video,
+                '-i', sped_audio_path,
+                '-c:v', 'copy',
+                '-c:a', 'aac', '-b:a', '128k',
+                '-shortest',
+                '-movflags', '+faststart',
+                final_out
+            ]
         rc = subprocess.run(mix_cmd, capture_output=True, timeout=300).returncode
         if rc != 0 or not Path(final_out).exists():
             err('Audio mix failed')
@@ -1013,7 +1408,7 @@ def main():
         info(f'✅ Screenshot Recap ready: {size_mb} MB')
         progress(92, 'render_done')
 
-        # Cleanup segments and shots
+        # Cleanup
         for sp in seg_clips:
             try: os.remove(sp)
             except: pass
@@ -1022,7 +1417,8 @@ def main():
 
         # Upload
         info('Starting uploads …')
-        links = do_uploads(final_out, title, uploads_cfg)
+        effective_drive = sr_drive_folder or drive_folder
+        links = do_uploads(final_out, title, uploads_cfg, drive_folder=effective_drive)
         progress(100, 'done')
         emit({'type': 'done', 'outputs': [{'file': os.path.basename(final_out), 'links': links}]})
 

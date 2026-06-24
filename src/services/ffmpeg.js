@@ -17,7 +17,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { ffTime } = require('../utils/timestamp');
-const { renderTitlePng } = require('./titleRenderer');
+const { renderTitlePng, renderHalftoneBg, renderSubtitlePng } = require('./titleRenderer');
 
 const RUNNING = new Map();
 function trackProc(jobId, proc) {
@@ -73,10 +73,13 @@ async function makeClip({
   colorGrade = 'none',
   musicFile = null,
   musicVolume = 0.15,
+  musicStart = 0,
+  musicEnd = 0,
   output, workDir, jobLog, jobId,
   customHeaderText = '',
   followText = 'Follow Us',
   ducking = null,
+  subtitles = [],
 }) {
   const W = VIDEO_WIDTH;
   const H = VIDEO_HEIGHT;
@@ -202,6 +205,10 @@ async function makeClip({
     micIdx = idx++;
   }
   if (hasMusicFile) {
+    const mStart = Math.max(0, Number(musicStart) || 0);
+    const mEnd   = Number(musicEnd) || 0;
+    if (mStart > 0) inputs.push('-ss', ffTime(mStart));
+    if (mEnd > mStart) inputs.push('-t', ffTime(mEnd - mStart));
     inputs.push('-stream_loop', '-1', '-i', musicFile);
     musicIdx = idx++;
   }
@@ -251,7 +258,9 @@ async function makeClip({
   }
 
   // Title card background
-  layer = applyTitleBackground(videoChain, layer, titleStyle, styleConfig, W, titleY, titleBandH);
+  const htState = { idx };
+  layer = applyTitleBackground(videoChain, layer, titleStyle, styleConfig, W, titleY, titleBandH, { workDir, inputs, idx: htState });
+  idx = htState.idx;
 
   // Speaker bar background
   if (speakerPng) {
@@ -287,9 +296,92 @@ async function makeClip({
     const spkX = hasMic ? (groupX + micW + 14) : Math.floor((W - spkCanvasW) / 2);
     const spkCanvasH = Math.floor(speakerBandH * 0.85);
     const spkY2 = speakerY + Math.floor((speakerBandH - spkCanvasH) / 2);
-    videoChain.push(`${layer}[${speakerIdx}:v]overlay=${spkX}:${spkY2}:format=auto[v]`);
+    videoChain.push(`${layer}[${speakerIdx}:v]overlay=${spkX}:${spkY2}:format=auto[v0]`);
   } else {
-    videoChain.push(`${layer}null[v]`);
+    videoChain.push(`${layer}null[v0]`);
+  }
+
+  // ── Subtitle overlay ────────────────────────────────────────────────────────
+  // subtitles = [{ t: "00:00:02", text: "বাক্যটি এখানে" }, ...]
+  // Each line fades in (0.15s), stays visible, fades out (0.15s) before next.
+  // Position: bottom of video square, 16px above bottom edge.
+  if (Array.isArray(subtitles) && subtitles.length > 0) {
+    const SUBTITLE_FADE = 0.15;
+
+    function parseSubTs(ts) {
+      const parts = String(ts).trim().split(':');
+      if (parts.length === 3) return +parts[0] * 3600 + +parts[1] * 60 + +parts[2];
+      if (parts.length === 2) return +parts[0] * 60 + +parts[1];
+      return parseFloat(ts) || 0;
+    }
+
+    const subtitleFontSize = Math.max(32, Math.floor(videoSQ / 16));  // slightly smaller
+    const subtitleH = subtitleFontSize + 48;
+    const subtitleMarginX = 60;                                        // left/right margin
+    const subtitleW = W - subtitleMarginX * 2;
+    const subtitleY = videoY + videoSQ - subtitleH - 60;              // higher up, safe zone
+
+    jobLog.info(`📝 Rendering ${subtitles.length} subtitle line(s)…`);
+
+    let subLayer = '[v0]';
+
+    for (let si = 0; si < subtitles.length; si++) {
+      const sub = subtitles[si];
+      const subStart = parseSubTs(sub.t);
+      const rawEnd = si + 1 < subtitles.length
+        ? parseSubTs(subtitles[si + 1].t)
+        : duration;
+      const subEnd = Math.max(subStart + 0.5, rawEnd);
+
+      const subPng = path.join(workDir, `sub_${String(si).padStart(3, '0')}.png`);
+      renderSubtitlePng({
+        text:        sub.text || '',
+        width:       subtitleW,
+        height:      subtitleH,
+        fontSize:    subtitleFontSize,
+        outPath:     subPng,
+        colorOffset: si % 5,
+      });
+
+      inputs.push('-i', subPng);
+      const subIdx = idx++;
+
+      const fadeExpr =
+        `if(lt(t,${subStart.toFixed(3)}),0,` +
+        `if(lt(t,${(subStart + SUBTITLE_FADE).toFixed(3)}),` +
+          `(t-${subStart.toFixed(3)})/${SUBTITLE_FADE},` +
+        `if(lt(t,${(subEnd - SUBTITLE_FADE).toFixed(3)}),1,` +
+        `if(lt(t,${subEnd.toFixed(3)}),` +
+          `(${subEnd.toFixed(3)}-t)/${SUBTITLE_FADE},` +
+        `0))))`;
+
+      const subX = subtitleMarginX;  // left-aligned to margin
+      const outLabel = `[vsub${si}]`;
+
+      // overlay 'enable' expression — no geq/alpha needed, works on all FFmpeg versions
+      const enableExpr = `between(t,${subStart.toFixed(3)},${subEnd.toFixed(3)})`;
+
+      videoChain.push(
+        `[${subIdx}:v]scale=${subtitleW}:${subtitleH}:flags=lanczos,format=rgba[sscaled${si}]`
+      );
+      videoChain.push(
+        `${subLayer}[sscaled${si}]overlay=${subX}:${subtitleY}:format=auto:enable='${enableExpr}'${outLabel}`
+      );
+      subLayer = outLabel;
+    }
+
+    // Rename final subtitle output back to [v0] for vignette step
+    videoChain.push(`${subLayer}null[v0]`);
+  }
+  // ── End subtitle overlay ────────────────────────────────────────────────────
+
+  // Progress bar — 3px gold line grows left to right (yellow_box only). Vignette removed.
+  if (titleStyle === 'yellow_box') {
+    videoChain.push(
+      `[v0]drawbox=x=0:y=${H - 3}:w='min(iw\,t/${duration}*iw)':h=3:color=0xFFD700@0.9:t=fill[v]`
+    );
+  } else {
+    videoChain.push(`[v0]null[v]`);
   }
 
   // Audio mixing / ducking
@@ -358,19 +450,28 @@ async function makeClip({
     const proc = spawn('ffmpeg', args, { stdio: ['ignore', 'pipe', 'pipe'] });
     if (jobId) trackProc(jobId, proc);
     let lastErr = '';
+    // Timeout: max(300s, duration*8) — kills stuck FFmpeg and rejects
+    const timeoutMs = Math.max(300, duration * 8) * 1000;
+    const timer = setTimeout(() => {
+      jobLog.warn(`⏰ FFmpeg timeout after ${Math.round(timeoutMs/1000)}s — killing stuck process`);
+      try { proc.kill('SIGKILL'); } catch (_) {}
+      reject(new Error(`ffmpeg timeout after ${Math.round(timeoutMs/1000)}s`));
+    }, timeoutMs);
     proc.stdout.on('data', d => d.toString().split(/\r?\n/).forEach(l => l && jobLog.info(`ffmpeg> ${l}`)));
     proc.stderr.on('data', d => {
       const t = d.toString();
       lastErr += t;
       t.split(/\r?\n/).forEach(l => l && jobLog.info(`ffmpeg> ${l.trim()}`));
     });
-    proc.on('error', reject);
-    proc.on('close', code => {
+    proc.on('error', (e) => { clearTimeout(timer); reject(e); });
+    proc.on('close', (code, signal) => {
+      clearTimeout(timer);
       if (code === 0) {
         jobLog.info(`ffmpeg done: ${path.basename(output)}`);
         resolve(output);
       } else {
-        reject(new Error(`ffmpeg exited ${code}: ${lastErr.slice(-500)}`));
+        const reason = signal ? `killed by signal ${signal}` : `exited code ${code}`;
+        reject(new Error(`ffmpeg ${reason}: ${lastErr.slice(-500)}`));
       }
     });
   });
@@ -402,10 +503,13 @@ function concatClips(inputs, output, jobLog, jobId) {
       t.split(/\r?\n/).forEach(l => l && jobLog.info(`ffmpeg> ${l.trim()}`));
     });
     proc.on('error', reject);
-    proc.on('close', code => {
+    proc.on('close', (code, signal) => {
       try { fs.unlinkSync(listFile); } catch (_) {}
       if (code === 0) resolve(output);
-      else reject(new Error(`ffmpeg concat exited ${code}: ${lastErr.slice(-500)}`));
+      else {
+        const reason = signal ? `killed by signal ${signal}` : `exited code ${code}`;
+        reject(new Error(`ffmpeg concat ${reason}: ${lastErr.slice(-500)}`));
+      }
     });
   });
 }
@@ -556,12 +660,18 @@ function getStyleConfig(titleStyle, W) {
   return configs[titleStyle] || configs.centered;
 }
 
-function applyTitleBackground(videoChain, layer, titleStyle, styleConfig, W, titleY, titleBandH) {
+function applyTitleBackground(videoChain, layer, titleStyle, styleConfig, W, titleY, titleBandH, { workDir = null, inputs = null, idx = null } = {}) {
   if (titleStyle === 'yellow_box') {
     const bm = 24, by2 = titleY + 12;
     const bw = W - 2 * bm, bh = titleBandH - 24;
+    // Black border
     videoChain.push(`${layer}drawbox=x=${bm - 3}:y=${by2 - 3}:w=${bw + 6}:h=${bh + 6}:color=black:t=fill[bb1]`);
-    videoChain.push(`[bb1]drawbox=x=${bm}:y=${by2}:w=${bw}:h=${bh}:color=0xFFD700:t=fill[bb2]`);
+    // Pro title bg: gradient + halftone + accent + highlight (PIL, once)
+    const htPng = path.join(workDir, 'title_bg.png');
+    renderHalftoneBg({ width: bw, height: bh, outPath: htPng });
+    inputs.push('-i', htPng);
+    const htIdx = idx.idx++;
+    videoChain.push(`[bb1][${htIdx}:v]overlay=${bm}:${by2}:format=auto[bb2]`);
     return '[bb2]';
   }
   if (titleStyle === 'natok_emotional' || titleStyle === 'natok_header_v1') {
@@ -608,10 +718,14 @@ function applyColorGrade(videoChain, grade) {
     filter = `curves=red='0/0 0.5/0.44 1/0.92':green='0/0 0.5/0.50 1/1':blue='0/0 0.5/0.58 1/1.0',eq=saturation=0.9:contrast=1.08:brightness=-0.03`;
   } else if (grade === 'cinema') {
     filter = `curves=all='0/0.05 0.5/0.5 1/0.95',eq=saturation=0.85:contrast=1.15:gamma=0.95`;
+  } else if (grade === 'bright') {
+    filter = `eq=brightness=0.06:contrast=1.08:saturation=1.1:gamma=0.92`;
+  } else if (grade === 'natural') {
+    filter = `eq=brightness=0.02:contrast=1.03:saturation=1.05:gamma=0.98`;
   }
 
   videoChain.push(`[sq]${filter}[graded]`);
   return 'graded';
 }
 
-module.exports = { makeClip, concatClips, FFMPEG_MODULE_VERSION, killJob };
+module.exports = { makeClip, concatClips, FFMPEG_MODULE_VERSION, killJob, __RUNNING__: RUNNING };

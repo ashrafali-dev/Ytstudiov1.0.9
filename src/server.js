@@ -29,6 +29,7 @@ const jobsNatokRoutes      = require('./routes/jobs-natok');
 const jobsBulkRoutes       = require('./routes/jobs-bulk');
 const jobsSubburnerRoutes  = require('./routes/jobs-subburner');
 const driveRoutes          = require('./routes/drive');
+const telegramRoutes       = require('./routes/telegram');
 const setupRoutes          = require('./routes/setup');
 const xray              = require('./services/xray');
 const { logger }        = require('./utils/logger');
@@ -131,6 +132,7 @@ app.use('/api/jobs/bulk',      jobsBulkRoutes);
 app.use('/api/jobs/subburner', jobsSubburnerRoutes);
 app.use('/api/jobs',           jobsClipperRoutes);   // legacy alias → clipper (kept last)
 app.use('/api/drive',         driveRoutes);
+app.use('/api/telegram',      telegramRoutes);
 app.use('/api/setup',         setupRoutes);
 
 app.use('/files', express.static(DATA_DIR, {
@@ -171,6 +173,8 @@ app.listen(PORT, () => {
   logger.info(`   Cookies: ${fs.existsSync(process.env.COOKIES_FILE || '/app/data/cookies/cookies.txt') ? '✓' : '✗'}`);
   logger.info(`   VMess  : ${process.env.VMESS_LINK ? '✓ link saved' : '✗ none'}`);
   logger.info(`   Proxy  : ${process.env.YTDLP_PROXY ? '✓ ' + process.env.YTDLP_PROXY.replace(/:[^:@]*@/, ':***@') : '✗ none'}`);
+  const tgChannelsSet = ['TELEGRAM_CHAT_ID_WAZ', 'TELEGRAM_CHAT_ID_NATOK', 'TELEGRAM_CHAT_ID_BULK'].filter(k => process.env[k]).length;
+  logger.info(`   Telegram: ${process.env.TELEGRAM_BOT_TOKEN ? `✓ bot token set, ${tgChannelsSet}/3 channel(s) configured` : '✗ TELEGRAM_BOT_TOKEN not set'}`);
   logger.info(`   Output : ${DATA_DIR}`);
 
   if (process.env.VMESS_LINK) {

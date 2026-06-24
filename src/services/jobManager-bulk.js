@@ -102,6 +102,9 @@ function createJob(payload) {
       durationMs: 0,
       error: null,
       driveFileId: null,
+      telegramUploaded: false,
+      telegramMessageId: null,
+      telegramFileId: null,
     })),
     summary: { total: urls.length, ok: 0, failed: 0 },
     error: null,
@@ -200,4 +203,4 @@ function deleteJob(id) {
   return true;
 }
 
-module.exports = { createJob, getJob, listJobs, deleteJob };
+module.exports = { createJob, getJob, listJobs, deleteJob, saveStore };

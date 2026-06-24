@@ -7,7 +7,7 @@
 // POT (BotGuard) provider integration fully stripped per user request.
 // =====================================================================
 
-const YTDLP_MODULE_VERSION = '2.6.0-per-clip-partial-noPOT';
+const YTDLP_MODULE_VERSION = '2.7.0-progressive-fast';
 
 const { spawn, execSync } = require('child_process');
 const path = require('path');
@@ -68,17 +68,17 @@ function buildCommonArgs(jobLog) {
     '--add-header', 'Origin:https://www.youtube.com',
   ];
 
-  // SOCKS5 + HLS keepalive fix: prefer ffmpeg downloader, single connection
+  // Parallel chunking — same as bulk v3.0.5 (works over VMess/SOCKS5 tunnel too)
+  args.push(
+    '--hls-prefer-native',
+    '--concurrent-fragments', '4',
+    '-N', '4',
+    '--http-chunk-size', '10M',
+  );
   if (isSocks) {
-    args.push(
-      '--hls-prefer-ffmpeg',
-      '--concurrent-fragments', '1',
-      '-N', '1',
-      '--no-part',
-    );
-    if (jobLog) jobLog.info('🔧 SOCKS5 mode: using ffmpeg HLS downloader, single fragment');
+    if (jobLog) jobLog.info('🔧 VMess/SOCKS5 mode: parallel chunking (4 connections, 10M chunks)');
   } else {
-    args.push('--hls-prefer-native', '--concurrent-fragments', '4');
+    if (jobLog) jobLog.info('🔧 Direct mode: parallel chunking (4 connections, 10M chunks)');
   }
 
   // Deno JS runtime — required for yt-dlp 2025.11+ JS challenge
@@ -189,7 +189,7 @@ async function downloadOneSection(url, workDir, sectionIndex, range, jobLog, has
       ...commonArgs,
       '--extractor-args', `youtube:player_client=${strategy.client}`,
       '--download-sections', sectionStr,
-      '-f', 'bv*[height<=720][ext=mp4][vcodec^=avc]+ba[ext=m4a]/bv*[height<=720][ext=mp4]+ba[ext=m4a]/bv*[height<=720]+ba/b[height<=720]/bv*+ba/b',
+      '-f', 'b[height<=720][ext=mp4][protocol*=https]/b[height<=480][ext=mp4][protocol*=https]/b[height<=360][ext=mp4][protocol*=https]/bv*[height<=720][ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b',
       '--merge-output-format', 'mp4',
       '-o', outTpl,
       url,
@@ -251,7 +251,7 @@ async function downloadFull(url, workDir, jobLog, hasCookies, proxyType, jobId) 
     const args = [
       ...commonArgs,
       '--extractor-args', `youtube:player_client=${strategy.client}`,
-      '-f', 'bv*[height<=720][ext=mp4][vcodec^=avc]+ba[ext=m4a]/bv*[height<=720][ext=mp4]+ba[ext=m4a]/bv*[height<=720]+ba/b[height<=720]/bv*+ba/b',
+      '-f', 'b[height<=720][ext=mp4][protocol*=https]/b[height<=480][ext=mp4][protocol*=https]/b[height<=360][ext=mp4][protocol*=https]/bv*[height<=720][ext=mp4]+ba[ext=m4a]/bv*+ba/b[ext=mp4]/b',
       '--merge-output-format', 'mp4',
       '-o', outTpl,
       url,
@@ -349,5 +349,6 @@ module.exports = {
   STRATEGIES,
   detectDeno,
   detectProxyType,
+  buildCommonArgs,
   killJob,
 };
